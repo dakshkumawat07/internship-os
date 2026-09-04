@@ -1,0 +1,23 @@
+﻿# Dependencies
+node_modules/
+
+# Environment / secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+
+# Prisma generated client (regenerate with: npx prisma generate)
+# Keep schema.prisma but not the generated client dir
+node_modules/.prisma/
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db

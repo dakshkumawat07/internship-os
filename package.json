@@ -1,0 +1,28 @@
+{
+  "name": "internship-os",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Evidence-based internship readiness platform",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "db:format": "npx prisma format",
+    "db:validate": "npx prisma validate",
+    "db:generate": "npx prisma generate",
+    "db:migrate:dev": "npx prisma migrate dev",
+    "db:migrate:deploy": "npx prisma migrate deploy"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0"
+  },
+  "allowScripts": {
+    "@prisma/client@5.22.0": true,
+    "@prisma/engines@5.22.0": true,
+    "prisma@5.22.0": true
+  }
+}

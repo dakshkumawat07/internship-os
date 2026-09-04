@@ -1,0 +1,633 @@
+// =============================================================================
+// InternshipOS - Prisma Schema
+// Ticket: feat(db): add initial Prisma schema
+// Source of truth: docs/DOMAIN_MODEL.md, docs/DECISIONS.md, docs/SCORING_MODEL.md
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS
+// Canonical names from docs/DOMAIN_MODEL.md and docs/DECISIONS.md
+// =============================================================================
+
+/// Importance level of a skill within a role framework (ADR-027).
+/// Maps directly to weight: CORE=4, IMPORTANT=3, USEFUL=2, OPTIONAL=1
+enum SkillImportance {
+  CORE
+  IMPORTANT
+  USEFUL
+  OPTIONAL
+}
+
+/// Evidence type -- distinguishes practical from learning evidence.
+/// Practical evidence requires an Artifact; learning evidence does not.
+enum EvidenceType {
+  PROJECT
+  GITHUB_REPOSITORY
+  HACKATHON
+  CERTIFICATE
+  COURSEWORK
+}
+
+/// Evidence category used by the scoring pipeline to split practical vs learning.
+enum EvidenceCategory {
+  PRACTICAL
+  LEARNING
+}
+
+/// Verification state of an evidence item.
+enum VerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/// Overall readiness tier mapped from WeightedAverage score (SCORING_MODEL.md 2.5).
+/// EARLY_STAGE: 0-39, NEEDS_WORK: 40-69, CLOSE: 70-84, READY: 85-100
+enum ReadinessTier {
+  EARLY_STAGE
+  NEEDS_WORK
+  CLOSE
+  READY
+}
+
+/// Confidence level for a SkillAssessment (SCORING_MODEL.md section 3).
+enum ConfidenceLevel {
+  NONE
+  LOW
+  MEDIUM
+  HIGH
+}
+
+/// Canonical ArtifactKey key types (SCORING_MODEL.md 5.2, DOMAIN_MODEL.md section 3).
+enum ArtifactKeyType {
+  REPOSITORY
+  PROJECT_DEMO
+}
+
+// =============================================================================
+// USER + AUTHENTICATION DOMAIN
+// =============================================================================
+
+/// Authentication identity and account ownership (DOMAIN_MODEL.md section 2 - User).
+model User {
+  id               String   @id @default(cuid())
+  email            String   @unique
+  passwordHash     String
+  /// Hashed refresh token stored for rotation/revocation.
+  refreshTokenHash String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  studentProfile StudentProfile?
+
+  @@map("users")
+}
+
+// =============================================================================
+// STUDENT PROFILE + ROLE FRAMEWORK
+// =============================================================================
+
+/// Student-specific profile used by InternshipOS (DOMAIN_MODEL.md section 2 - StudentProfile).
+model StudentProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Display name / full name
+  fullName       String?
+  /// Graduation year or expected graduation
+  graduationYear Int?
+  /// College or university
+  institution    String?
+  /// Short bio
+  bio            String?
+
+  /// Target internship role selected by the student.
+  targetRoleId String?
+  targetRole   Role?   @relation(fields: [targetRoleId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Owned resources
+  artifacts            Artifact[]
+  evidence             Evidence[]
+  readinessAssessments ReadinessAssessment[]
+
+  @@map("student_profiles")
+}
+
+/// A target internship role definition (DOMAIN_MODEL.md section 2 - Role).
+/// MVP roles: Software Engineer Intern, Backend Developer Intern,
+///            Frontend Developer Intern, Data Analyst Intern
+model Role {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  slug        String  @unique
+  description String?
+
+  /// The frameworkVersion whose RoleSkill rows are currently active (ADR-026).
+  /// Initial value: "mvp-1"
+  currentFrameworkVersion String   @default("mvp-1")
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  roleSkills           RoleSkill[]
+  studentProfiles      StudentProfile[]
+  readinessAssessments ReadinessAssessment[]
+
+  @@map("roles")
+}
+
+/// Associates a skill with a role and stores versioned importance/weight (DOMAIN_MODEL.md section 2 - RoleSkill).
+/// A (roleId, skillId) pair may appear in multiple rows across frameworkVersions (ADR-026).
+model RoleSkill {
+  id      String @id @default(cuid())
+  roleId  String
+  role    Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  skillId String
+  skill   Skill  @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  importance SkillImportance
+
+  /// Numeric weight matching importance (CORE=4, IMPORTANT=3, USEFUL=2, OPTIONAL=1).
+  /// Application layer enforces weight matches importance.
+  weight Int
+
+  /// Framework version this row belongs to (ADR-026). Initial: "mvp-1"
+  frameworkVersion String @default("mvp-1")
+
+  createdAt DateTime @default(now())
+
+  /// Canonical uniqueness: one (role, skill, frameworkVersion) row (ADR-028).
+  @@unique([roleId, skillId, frameworkVersion])
+  @@index([roleId, frameworkVersion])
+  @@map("role_skills")
+}
+
+/// A normalized technical skill assessed by InternshipOS (DOMAIN_MODEL.md section 2 - Skill).
+model Skill {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  roleSkills       RoleSkill[]
+  evidenceSkills   EvidenceSkill[]
+  skillAssessments SkillAssessment[]
+
+  @@map("skills")
+}
+
+// =============================================================================
+// SCORING CONFIGURATION
+// =============================================================================
+
+/// Versioned, immutable scoring configuration (DOMAIN_MODEL.md section 6).
+/// Each row represents one locked version; existing rows are never overwritten.
+/// The "currently active" version is resolved by the application at runtime.
+model ScoringConfig {
+  id          String  @id @default(cuid())
+  /// Canonical version string (e.g. "v1"). Unique -- version IS the identity (ADR-028).
+  version     String  @unique
+  description String?
+
+  // --- EvidenceScore formula coefficients ---
+  /// Weight of PracticalDepth in EvidenceScore formula (canonical: 0.6)
+  practicalDepthWeight Float
+  /// Weight of Quality in EvidenceScore formula (canonical: 0.4)
+  qualityWeight        Float
+
+  // --- Recency policy ---
+  /// Minimum RecencyMultiplier (canonical: 0.5)
+  recencyMin         Float
+  /// Maximum RecencyMultiplier (canonical: 1.0)
+  recencyMax         Float
+  /// Number of months at which recency penalty begins to apply
+  recencyDecayMonths Int
+
+  // --- Practical aggregation weights ---
+  /// Multiplier for strongest practical artifact P1 (canonical: 1.00)
+  practicalW1               Float
+  /// Multiplier for second qualifying practical artifact P2 (canonical: 0.10)
+  practicalW2               Float
+  /// Multiplier for third qualifying practical artifact P3 (canonical: 0.05)
+  practicalW3               Float
+  /// Multiplier for P4 and every subsequent qualifying artifact (canonical: 0.02)
+  practicalWTail            Float
+  /// 50% support threshold: Pi qualifies only when Pi >= threshold * P1 (canonical: 0.50)
+  practicalSupportThreshold Float
+
+  // --- Certificate aggregation ---
+  /// Maximum SkillScore contribution from certificates when practical evidence exists (canonical: 5)
+  certCapWithPractical   Float
+  /// Maximum SkillScore contribution from certificates when no practical evidence exists (canonical: 40)
+  certCapAlone           Float
+  /// Multiplier for C1 in standalone certificate mode (canonical: 1.0 implied)
+  certW1Standalone       Float
+  /// Multiplier for C2 in standalone certificate mode (canonical: 0.15)
+  certW2Standalone       Float
+  /// Multiplier for C3+ tail in standalone certificate mode (canonical: 0.05)
+  certWTailStandalone    Float
+  /// Multiplier for C1 when practical evidence exists (canonical: 0.05)
+  certW1WithPractical    Float
+  /// Multiplier for C2+ tail when practical evidence exists (canonical: 0.02)
+  certWTailWithPractical Float
+
+  // --- Readiness tier thresholds ---
+  /// Lower bound for NEEDS_WORK tier (canonical: 40)
+  tierNeedsWorkMin Int
+  /// Lower bound for CLOSE tier (canonical: 70)
+  tierCloseMin     Int
+  /// Lower bound for READY tier (canonical: 85)
+  tierReadyMin     Int
+  /// CORE gate: a CORE skill below this prevents overall tier exceeding NEEDS_WORK (canonical: 40)
+  coreGateMin      Int
+
+  isActive  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  readinessAssessments ReadinessAssessment[]
+
+  @@map("scoring_configs")
+}
+
+// =============================================================================
+// ARTIFACT DOMAIN
+// =============================================================================
+
+/// The lineage/consolidation root (DOMAIN_MODEL.md section 3 - Artifact, ADR-019/020).
+/// Represents the underlying body of work (project, repo, hackathon build, course).
+/// Does NOT have parentArtifactId or lineageId -- identity is via ArtifactKey only.
+model Artifact {
+  id               String         @id @default(cuid())
+  /// Owner -- all Artifact rows are student-scoped (IDOR prevention, ADR-022).
+  studentProfileId String
+  studentProfile   StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  artifactKeys             ArtifactKey[]
+  /// Evidence rows that represent this artifact (primary reference).
+  evidence                 Evidence[]                @relation("ArtifactEvidence")
+  /// Evidence rows that corroborate this artifact (certificate/capstone link, ADR-024).
+  corroboratingEvidence    Evidence[]                @relation("CorroboratesArtifact")
+  /// Snapshot FK rows -- SET NULL on delete (DOMAIN_MODEL.md section 10 delete behavior).
+  skillAssessmentEvidences SkillAssessmentEvidence[]
+
+  @@index([studentProfileId])
+  @@map("artifacts")
+}
+
+/// Canonical identity mechanism (DOMAIN_MODEL.md section 3 - ArtifactKey, ADR-020, ADR-028).
+/// One Artifact may have multiple ArtifactKey rows (e.g. REPOSITORY + PROJECT_DEMO).
+/// Identity is scoped per student -- the same canonical URL maps to at most one Artifact per student.
+model ArtifactKey {
+  id               String          @id @default(cuid())
+  artifactId       String
+  artifact         Artifact        @relation(fields: [artifactId], references: [id], onDelete: Cascade)
+  /// Owner redundantly stored for the composite uniqueness constraint (ADR-028).
+  studentProfileId String
+  keyType          ArtifactKeyType
+
+  /// Canonicalized/normalized identity string (e.g. normalized repo URL). Must be non-empty.
+  normalizedValue String
+
+  createdAt DateTime @default(now())
+
+  /// Canonical uniqueness: one (student, keyType, normalizedValue) row (ADR-028).
+  @@unique([studentProfileId, keyType, normalizedValue])
+  @@index([artifactId])
+  @@map("artifact_keys")
+}
+
+// =============================================================================
+// EVIDENCE DOMAIN
+// =============================================================================
+
+/// Student-submitted evidence record (DOMAIN_MODEL.md section 3 - Evidence).
+/// Evidence IS the representation -- no separate ArtifactRepresentation table (ADR-021).
+model Evidence {
+  id               String         @id @default(cuid())
+  /// Owner -- evidence is always student-scoped (IDOR prevention).
+  studentProfileId String
+  studentProfile   StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+
+  type        EvidenceType
+  category    EvidenceCategory
+  title       String
+  description String?
+
+  // --- Artifact linkage (ADR-022) ---
+  /// Required for PRACTICAL evidence; the Artifact this Evidence represents.
+  /// Must belong to same studentProfileId (composite ownership check at write time).
+  artifactId String?
+  artifact   Artifact? @relation("ArtifactEvidence", fields: [artifactId], references: [id], onDelete: Restrict)
+
+  /// Optional -- set when this Evidence (certificate/capstone) corroborates a separately-submitted
+  /// practical Artifact without being its primary representation (ADR-024, ADR-010).
+  /// Must belong to same studentProfileId (composite ownership check at write time).
+  corroboratesArtifactId String?
+  corroboratesArtifact   Artifact? @relation("CorroboratesArtifact", fields: [corroboratesArtifactId], references: [id], onDelete: Restrict)
+
+  /// Optional student hint that this evidence belongs to an existing artifact.
+  /// Server resolves final artifact identity via ArtifactKey; this is informational only.
+  declaredArtifactId String?
+
+  // --- Recency anchor (ADR-023) ---
+  /// Single date used as the recency anchor by RecencyMultiplier.
+  activityDate DateTime
+
+  // --- URLs ---
+  sourceUrl String?
+  demoUrl   String?
+
+  // --- Verification ---
+  verificationStatus VerificationStatus @default(UNVERIFIED)
+
+  // --- Soft delete ---
+  deletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  evidenceSkills           EvidenceSkill[]
+  certificateDetail        CertificateDetail?
+  gitHubRepositoryLink     GitHubRepositoryLink?
+  hackathonDetail          HackathonDetail?
+  /// Snapshot rows -- SET NULL on delete (DOMAIN_MODEL.md section 10 delete behavior).
+  skillAssessmentEvidences SkillAssessmentEvidence[]
+
+  @@index([studentProfileId])
+  @@index([studentProfileId, deletedAt])
+  @@index([artifactId])
+  @@map("evidence")
+}
+
+/// Associates an Evidence record with a specific Skill (DOMAIN_MODEL.md section 3 - EvidenceSkill).
+/// Contains factual answers only -- PracticalDepth/Quality are derived at assessment time.
+model EvidenceSkill {
+  id         String   @id @default(cuid())
+  evidenceId String
+  evidence   Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+  skillId    String
+  skill      Skill    @relation(fields: [skillId], references: [id], onDelete: Restrict)
+
+  /// The structured-rubric schema version these answers were collected under (ADR-025).
+  /// Permanently associated with this row; never silently reinterpreted under a different version.
+  questionSetVersion String
+
+  /// Structured factual answers used to derive PracticalDepth/Quality at assessment time.
+  /// JSON blob; schema is defined by questionSetVersion.
+  answers Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Canonical uniqueness: one (evidence, skill) row (ADR-028).
+  @@unique([evidenceId, skillId])
+  @@index([skillId])
+  @@map("evidence_skills")
+}
+
+// =============================================================================
+// EVIDENCE DETAIL TABLES
+// Supporting facts for specific evidence types (DOMAIN_MODEL.md sections 4, 5)
+// =============================================================================
+
+/// Certificate/course facts (DOMAIN_MODEL.md section 4 - CertificateDetail).
+model CertificateDetail {
+  id         String   @id @default(cuid())
+  evidenceId String   @unique
+  evidence   Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  issuingOrganization String?
+  courseName          String?
+  completionDate      DateTime?
+  credentialUrl       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("certificate_details")
+}
+
+/// Supplementary GitHub repository facts (DOMAIN_MODEL.md section 5 - GitHubRepositoryLink).
+/// Canonical repository identity for deduplication lives on ArtifactKey, NOT here (ADR-020).
+model GitHubRepositoryLink {
+  id         String   @id @default(cuid())
+  evidenceId String   @unique
+  evidence   Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  /// GitHub owner/repo identifier (e.g. "username/repo-name")
+  repoOwner   String?
+  repoName    String?
+  description String?
+  /// Raw repository URL (for display). Normalized version lives on ArtifactKey.
+  repoUrl     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("github_repository_links")
+}
+
+/// Hackathon/competition event facts (DOMAIN_MODEL.md section 5 - HackathonDetail).
+model HackathonDetail {
+  id         String   @id @default(cuid())
+  evidenceId String   @unique
+  evidence   Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  eventName               String?
+  organizer               String?
+  eventDate               DateTime?
+  teamSize                Int?
+  placement               String?
+  /// Student's specific contribution context (important for team evidence per RULES.md).
+  contributionDescription String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("hackathon_details")
+}
+
+// =============================================================================
+// DERIVED ASSESSMENT DOMAIN -- IMMUTABLE SNAPSHOT HIERARCHY
+// DOMAIN_MODEL.md section 7
+// =============================================================================
+
+/// Immutable readiness assessment snapshot for a target role at a specific evaluationDate.
+/// (DOMAIN_MODEL.md section 7 - ReadinessAssessment)
+model ReadinessAssessment {
+  id               String         @id @default(cuid())
+  studentProfileId String
+  studentProfile   StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Restrict)
+  roleId           String
+  role             Role           @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  /// Explicit evaluation date -- the engine receives this, never the system clock (ADR-002).
+  evaluationDate DateTime
+
+  /// FK to the ScoringConfig used for this assessment.
+  scoringConfigId String
+  scoringConfig   ScoringConfig @relation(fields: [scoringConfigId], references: [id], onDelete: Restrict)
+
+  /// Snapshot of the scoringConfig.version string for historical reproducibility (DOMAIN_MODEL.md section 9).
+  scoringConfigVersion String
+
+  /// Role-skill framework version used to weight this assessment (ADR-026).
+  frameworkVersion String
+
+  // --- Derived snapshot values ---
+  /// Weighted average readiness score (0-100).
+  overallScore  Float
+  readinessTier ReadinessTier
+
+  /// Whether any CORE skill fell below the CORE gate minimum (SCORING_MODEL.md section 2.4).
+  coreGateTriggered Boolean @default(false)
+
+  /// JSON array of skill IDs that triggered the CORE gate, if any.
+  coreGateSkillIds Json @default("[]")
+
+  createdAt DateTime @default(now())
+
+  skillAssessments SkillAssessment[]
+
+  @@index([studentProfileId])
+  @@index([studentProfileId, evaluationDate])
+  @@map("readiness_assessments")
+}
+
+/// Immutable per-skill assessment belonging to a ReadinessAssessment.
+/// (DOMAIN_MODEL.md section 7 - SkillAssessment)
+model SkillAssessment {
+  id                    String              @id @default(cuid())
+  readinessAssessmentId String
+  readinessAssessment   ReadinessAssessment @relation(fields: [readinessAssessmentId], references: [id], onDelete: Restrict)
+  skillId               String
+  skill                 Skill               @relation(fields: [skillId], references: [id], onDelete: Restrict)
+
+  // --- Snapshot of role importance/weight at assessment time ---
+  importance SkillImportance
+  /// Snapshot of the numeric weight at assessment time (CORE=4, IMPORTANT=3, USEFUL=2, OPTIONAL=1).
+  weight     Int
+  confidence ConfidenceLevel
+
+  // --- Derived snapshot values ---
+  skillScore             Float
+  /// Number of distinct practical artifacts contributing to this skill score.
+  practicalArtifactCount Int   @default(0)
+  /// Number of certificate evidence items contributing to this skill score.
+  certificateCount       Int   @default(0)
+
+  createdAt DateTime @default(now())
+
+  skillAssessmentEvidences SkillAssessmentEvidence[]
+
+  /// Canonical uniqueness: one (assessment, skill) row (ADR-028).
+  @@unique([readinessAssessmentId, skillId])
+  @@index([skillId])
+  @@map("skill_assessments")
+}
+
+/// Immutable snapshot of evidence contributing to a SkillAssessment.
+/// (DOMAIN_MODEL.md section 7 - SkillAssessmentEvidence)
+/// Stores DENORMALIZED snapshot values so historical assessments remain valid
+/// even if live Evidence/Artifact rows are later edited or deleted (DOMAIN_MODEL.md section 10).
+model SkillAssessmentEvidence {
+  id                String          @id @default(cuid())
+  skillAssessmentId String
+  skillAssessment   SkillAssessment @relation(fields: [skillAssessmentId], references: [id], onDelete: Restrict)
+
+  // --- Live FKs -- SET NULL on delete; snapshot values remain authoritative (DOMAIN_MODEL.md section 10) ---
+  evidenceId String?
+  evidence   Evidence? @relation(fields: [evidenceId], references: [id], onDelete: SetNull)
+  artifactId String?
+  artifact   Artifact? @relation(fields: [artifactId], references: [id], onDelete: SetNull)
+
+  // --- Denormalized snapshot values (immutable, authoritative even after live data changes) ---
+  /// Snapshot of EvidenceScore at assessment time (0-100).
+  evidenceScore      Float
+  /// Snapshot of Evidence.activityDate used for recency calculation.
+  activityDate       DateTime
+  /// Snapshot of questionSetVersion the answers were collected under (ADR-025).
+  questionSetVersion String
+  /// Whether this evidence item was the primary practical artifact (P1).
+  isPrimaryPractical Boolean          @default(false)
+  /// Whether this evidence was categorized as practical or learning at assessment time.
+  evidenceCategory   EvidenceCategory
+
+  createdAt DateTime @default(now())
+
+  @@index([skillAssessmentId])
+  @@index([evidenceId])
+  @@map("skill_assessment_evidence")
+}
+
+// =============================================================================
+// ACTION PLAN DOMAIN
+// DOMAIN_MODEL.md section 8
+// =============================================================================
+
+/// Role-specific action plan generated from identified skill gaps (DOMAIN_MODEL.md section 8).
+model ActionPlan {
+  id                    String  @id @default(cuid())
+  studentProfileId      String
+  /// Optional link to the ReadinessAssessment that generated this plan.
+  readinessAssessmentId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  actionItems ActionItem[]
+
+  @@index([studentProfileId])
+  @@map("action_plans")
+}
+
+/// A concrete next action associated with a skill gap (DOMAIN_MODEL.md section 8).
+model ActionItem {
+  id           String     @id @default(cuid())
+  actionPlanId String
+  actionPlan   ActionPlan @relation(fields: [actionPlanId], references: [id], onDelete: Cascade)
+  skillId      String?
+  title        String
+  description  String?
+  priority     Int        @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  taskCompletions TaskCompletion[]
+
+  @@index([actionPlanId])
+  @@map("action_items")
+}
+
+/// Tracks whether an action item was completed and supports progress/reassessment (DOMAIN_MODEL.md section 8).
+model TaskCompletion {
+  id           String     @id @default(cuid())
+  actionItemId String
+  actionItem   ActionItem @relation(fields: [actionItemId], references: [id], onDelete: Cascade)
+  completedAt  DateTime?
+  notes        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("task_completions")
+}
