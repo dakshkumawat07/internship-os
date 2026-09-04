@@ -1,7 +1,7 @@
 // =============================================================================
 // InternshipOS - Prisma Schema
-// Ticket: feat(db): add initial Prisma schema
-// Source of truth: docs/DOMAIN_MODEL.md, docs/DECISIONS.md, docs/SCORING_MODEL.md
+// Ticket: fix(db): enforce schema integrity and snapshot safety
+// Source of truth: docs/DOMAIN_MODEL.md, docs/DECISIONS.md, docs/SCORING_MODEL.md, docs/ARCHITECTURE.md
 // =============================================================================
 
 generator client {
@@ -123,6 +123,7 @@ model StudentProfile {
   artifacts            Artifact[]
   evidence             Evidence[]
   readinessAssessments ReadinessAssessment[]
+  actionPlans          ActionPlan[]
 
   @@map("student_profiles")
 }
@@ -161,7 +162,7 @@ model RoleSkill {
   importance SkillImportance
 
   /// Numeric weight matching importance (CORE=4, IMPORTANT=3, USEFUL=2, OPTIONAL=1).
-  /// Application layer enforces weight matches importance.
+  /// Enforced in PostgreSQL DDL by CHECK constraint.
   weight Int
 
   /// Framework version this row belongs to (ADR-026). Initial: "mvp-1"
@@ -187,6 +188,7 @@ model Skill {
   roleSkills       RoleSkill[]
   evidenceSkills   EvidenceSkill[]
   skillAssessments SkillAssessment[]
+  actionItems      ActionItem[]
 
   @@map("skills")
 }
@@ -197,7 +199,7 @@ model Skill {
 
 /// Versioned, immutable scoring configuration (DOMAIN_MODEL.md section 6).
 /// Each row represents one locked version; existing rows are never overwritten.
-/// The "currently active" version is resolved by the application at runtime.
+/// Protected by PostgreSQL BEFORE UPDATE trigger.
 model ScoringConfig {
   id          String  @id @default(cuid())
   /// Canonical version string (e.g. "v1"). Unique -- version IS the identity (ADR-028).
@@ -271,6 +273,7 @@ model ScoringConfig {
 /// The lineage/consolidation root (DOMAIN_MODEL.md section 3 - Artifact, ADR-019/020).
 /// Represents the underlying body of work (project, repo, hackathon build, course).
 /// Does NOT have parentArtifactId or lineageId -- identity is via ArtifactKey only.
+/// Supports composite ownership via @@unique([id, studentProfileId]).
 model Artifact {
   id               String         @id @default(cuid())
   /// Owner -- all Artifact rows are student-scoped (IDOR prevention, ADR-022).
@@ -281,13 +284,15 @@ model Artifact {
   updatedAt DateTime @updatedAt
 
   artifactKeys             ArtifactKey[]
-  /// Evidence rows that represent this artifact (primary reference).
+  /// Evidence rows that represent this artifact (primary reference via composite ownership FK).
   evidence                 Evidence[]                @relation("ArtifactEvidence")
-  /// Evidence rows that corroborate this artifact (certificate/capstone link, ADR-024).
+  /// Evidence rows that corroborate this artifact (certificate/capstone link via composite ownership FK).
   corroboratingEvidence    Evidence[]                @relation("CorroboratesArtifact")
   /// Snapshot FK rows -- SET NULL on delete (DOMAIN_MODEL.md section 10 delete behavior).
   skillAssessmentEvidences SkillAssessmentEvidence[]
 
+  /// Composite ownership anchor preventing cross-student references at schema level.
+  @@unique([id, studentProfileId])
   @@index([studentProfileId])
   @@map("artifacts")
 }
@@ -295,12 +300,13 @@ model Artifact {
 /// Canonical identity mechanism (DOMAIN_MODEL.md section 3 - ArtifactKey, ADR-020, ADR-028).
 /// One Artifact may have multiple ArtifactKey rows (e.g. REPOSITORY + PROJECT_DEMO).
 /// Identity is scoped per student -- the same canonical URL maps to at most one Artifact per student.
+/// Enforces composite owner-scoped foreign key to Artifact(id, studentProfileId).
 model ArtifactKey {
   id               String          @id @default(cuid())
   artifactId       String
-  artifact         Artifact        @relation(fields: [artifactId], references: [id], onDelete: Cascade)
-  /// Owner redundantly stored for the composite uniqueness constraint (ADR-028).
   studentProfileId String
+  /// Composite ownership foreign key: structurally prevents linking key to another student's artifact.
+  artifact         Artifact        @relation(fields: [artifactId, studentProfileId], references: [id, studentProfileId], onDelete: Cascade)
   keyType          ArtifactKeyType
 
   /// Canonicalized/normalized identity string (e.g. normalized repo URL). Must be non-empty.
@@ -311,6 +317,7 @@ model ArtifactKey {
   /// Canonical uniqueness: one (student, keyType, normalizedValue) row (ADR-028).
   @@unique([studentProfileId, keyType, normalizedValue])
   @@index([artifactId])
+  @@index([artifactId, studentProfileId])
   @@map("artifact_keys")
 }
 
@@ -320,6 +327,7 @@ model ArtifactKey {
 
 /// Student-submitted evidence record (DOMAIN_MODEL.md section 3 - Evidence).
 /// Evidence IS the representation -- no separate ArtifactRepresentation table (ADR-021).
+/// Uses composite owner-scoped FKs for artifactId and corroboratesArtifactId.
 model Evidence {
   id               String         @id @default(cuid())
   /// Owner -- evidence is always student-scoped (IDOR prevention).
@@ -331,17 +339,17 @@ model Evidence {
   title       String
   description String?
 
-  // --- Artifact linkage (ADR-022) ---
-  /// Required for PRACTICAL evidence; the Artifact this Evidence represents.
-  /// Must belong to same studentProfileId (composite ownership check at write time).
+  // --- Artifact linkage with composite ownership checks (BLOCKER 1 fix) ---
+  /// Required for PRACTICAL evidence; optional for LEARNING.
+  /// Structurally constrained to Artifact owned by the same studentProfileId.
   artifactId String?
-  artifact   Artifact? @relation("ArtifactEvidence", fields: [artifactId], references: [id], onDelete: Restrict)
+  artifact   Artifact? @relation("ArtifactEvidence", fields: [artifactId, studentProfileId], references: [id, studentProfileId], onDelete: Restrict)
 
   /// Optional -- set when this Evidence (certificate/capstone) corroborates a separately-submitted
   /// practical Artifact without being its primary representation (ADR-024, ADR-010).
-  /// Must belong to same studentProfileId (composite ownership check at write time).
+  /// Structurally constrained to Artifact owned by the same studentProfileId.
   corroboratesArtifactId String?
-  corroboratesArtifact   Artifact? @relation("CorroboratesArtifact", fields: [corroboratesArtifactId], references: [id], onDelete: Restrict)
+  corroboratesArtifact   Artifact? @relation("CorroboratesArtifact", fields: [corroboratesArtifactId, studentProfileId], references: [id, studentProfileId], onDelete: Restrict)
 
   /// Optional student hint that this evidence belongs to an existing artifact.
   /// Server resolves final artifact identity via ArtifactKey; this is informational only.
@@ -373,7 +381,8 @@ model Evidence {
 
   @@index([studentProfileId])
   @@index([studentProfileId, deletedAt])
-  @@index([artifactId])
+  @@index([artifactId, studentProfileId])
+  @@index([corroboratesArtifactId, studentProfileId])
   @@map("evidence")
 }
 
@@ -468,10 +477,12 @@ model HackathonDetail {
 // =============================================================================
 // DERIVED ASSESSMENT DOMAIN -- IMMUTABLE SNAPSHOT HIERARCHY
 // DOMAIN_MODEL.md section 7
+// Protected by PostgreSQL BEFORE UPDATE triggers (BLOCKER 5 fix)
 // =============================================================================
 
 /// Immutable readiness assessment snapshot for a target role at a specific evaluationDate.
 /// (DOMAIN_MODEL.md section 7 - ReadinessAssessment)
+/// Protected against UPDATE by PostgreSQL trigger trg_readiness_assessments_immutable.
 model ReadinessAssessment {
   id               String         @id @default(cuid())
   studentProfileId String
@@ -493,7 +504,7 @@ model ReadinessAssessment {
   frameworkVersion String
 
   // --- Derived snapshot values ---
-  /// Weighted average readiness score (0-100).
+  /// Weighted average readiness score (0-100). Enforced by CHECK constraint.
   overallScore  Float
   readinessTier ReadinessTier
 
@@ -506,7 +517,10 @@ model ReadinessAssessment {
   createdAt DateTime @default(now())
 
   skillAssessments SkillAssessment[]
+  actionPlans      ActionPlan[]
 
+  /// Composite uniqueness for owner-safe ActionPlan linkage.
+  @@unique([id, studentProfileId])
   @@index([studentProfileId])
   @@index([studentProfileId, evaluationDate])
   @@map("readiness_assessments")
@@ -514,6 +528,7 @@ model ReadinessAssessment {
 
 /// Immutable per-skill assessment belonging to a ReadinessAssessment.
 /// (DOMAIN_MODEL.md section 7 - SkillAssessment)
+/// Protected against UPDATE by PostgreSQL trigger trg_skill_assessments_immutable.
 model SkillAssessment {
   id                    String              @id @default(cuid())
   readinessAssessmentId String
@@ -523,11 +538,12 @@ model SkillAssessment {
 
   // --- Snapshot of role importance/weight at assessment time ---
   importance SkillImportance
-  /// Snapshot of the numeric weight at assessment time (CORE=4, IMPORTANT=3, USEFUL=2, OPTIONAL=1).
+  /// Snapshot of numeric weight at assessment time (CORE=4, IMPORTANT=3, USEFUL=2, OPTIONAL=1).
   weight     Int
   confidence ConfidenceLevel
 
   // --- Derived snapshot values ---
+  /// Skill score (0-100). Enforced by CHECK constraint.
   skillScore             Float
   /// Number of distinct practical artifacts contributing to this skill score.
   practicalArtifactCount Int   @default(0)
@@ -546,21 +562,26 @@ model SkillAssessment {
 
 /// Immutable snapshot of evidence contributing to a SkillAssessment.
 /// (DOMAIN_MODEL.md section 7 - SkillAssessmentEvidence)
-/// Stores DENORMALIZED snapshot values so historical assessments remain valid
-/// even if live Evidence/Artifact rows are later edited or deleted (DOMAIN_MODEL.md section 10).
+/// Distinguishes live optional references from immutable non-nullable snapshot identifiers (BLOCKER 2 fix).
+/// Protected against UPDATE by PostgreSQL trigger trg_skill_assessment_evidence_immutable.
 model SkillAssessmentEvidence {
   id                String          @id @default(cuid())
   skillAssessmentId String
   skillAssessment   SkillAssessment @relation(fields: [skillAssessmentId], references: [id], onDelete: Restrict)
 
-  // --- Live FKs -- SET NULL on delete; snapshot values remain authoritative (DOMAIN_MODEL.md section 10) ---
+  // --- Live optional FKs (SET NULL on delete -- does NOT mutate historical snapshot identifiers) ---
   evidenceId String?
   evidence   Evidence? @relation(fields: [evidenceId], references: [id], onDelete: SetNull)
   artifactId String?
   artifact   Artifact? @relation(fields: [artifactId], references: [id], onDelete: SetNull)
 
+  // --- Immutable snapshot identifiers (BLOCKER 2 fix: non-nullable, immune to live deletions) ---
+  evidenceIdSnapshot           String
+  artifactIdSnapshot           String
+  artifactCanonicalKeySnapshot String?
+
   // --- Denormalized snapshot values (immutable, authoritative even after live data changes) ---
-  /// Snapshot of EvidenceScore at assessment time (0-100).
+  /// Snapshot of EvidenceScore at assessment time (0-100). Enforced by CHECK constraint.
   evidenceScore      Float
   /// Snapshot of Evidence.activityDate used for recency calculation.
   activityDate       DateTime
@@ -575,20 +596,25 @@ model SkillAssessmentEvidence {
 
   @@index([skillAssessmentId])
   @@index([evidenceId])
+  @@index([evidenceIdSnapshot])
+  @@index([artifactIdSnapshot])
   @@map("skill_assessment_evidence")
 }
 
 // =============================================================================
 // ACTION PLAN DOMAIN
-// DOMAIN_MODEL.md section 8
+// DOMAIN_MODEL.md section 8 (BLOCKER 4 fix)
 // =============================================================================
 
 /// Role-specific action plan generated from identified skill gaps (DOMAIN_MODEL.md section 8).
+/// Belongs to StudentProfile and optionally references the generating ReadinessAssessment
+/// with composite owner-compatibility (fields: [readinessAssessmentId, studentProfileId]).
 model ActionPlan {
-  id                    String  @id @default(cuid())
+  id                    String               @id @default(cuid())
   studentProfileId      String
-  /// Optional link to the ReadinessAssessment that generated this plan.
+  studentProfile        StudentProfile       @relation(fields: [studentProfileId], references: [id], onDelete: Cascade)
   readinessAssessmentId String?
+  readinessAssessment   ReadinessAssessment? @relation(fields: [readinessAssessmentId, studentProfileId], references: [id, studentProfileId], onDelete: Restrict)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -596,15 +622,18 @@ model ActionPlan {
   actionItems ActionItem[]
 
   @@index([studentProfileId])
+  @@index([readinessAssessmentId, studentProfileId])
   @@map("action_plans")
 }
 
 /// A concrete next action associated with a skill gap (DOMAIN_MODEL.md section 8).
+/// Belongs to ActionPlan and must reference the Skill that represents the skill gap (BLOCKER 4 fix).
 model ActionItem {
   id           String     @id @default(cuid())
   actionPlanId String
   actionPlan   ActionPlan @relation(fields: [actionPlanId], references: [id], onDelete: Cascade)
-  skillId      String?
+  skillId      String
+  skill        Skill      @relation(fields: [skillId], references: [id], onDelete: Restrict)
   title        String
   description  String?
   priority     Int        @default(0)
@@ -615,6 +644,7 @@ model ActionItem {
   taskCompletions TaskCompletion[]
 
   @@index([actionPlanId])
+  @@index([skillId])
   @@map("action_items")
 }
 
@@ -629,5 +659,6 @@ model TaskCompletion {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@index([actionItemId])
   @@map("task_completions")
 }
