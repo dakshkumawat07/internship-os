@@ -1,6 +1,6 @@
 # docs/ARCHITECTURE.md
 
-**Status:** Locked. Protected file — see the protected-files list in `DECISIONS.md`. Baseline: the approved architecture review and `docs/DESIGN_SYSTEM.md` (also locked, not altered here).
+**Status:** Locked. Protected file — see the protected-files list in `DECISIONS.md`. Baseline: the approved architecture review and `docs/DESIGN_SYSTEM.md` (also locked, not altered here). §14 below records the architectural consequences of the Artifact/ArtifactKey/versioning review (`DECISIONS.md` ADR-019–030); it is an addition, not a rewrite of §1–13.
 
 ---
 
@@ -49,7 +49,7 @@ The engine is the product's trust mechanism, so its isolation is enforced struct
 
 ## 6. Future AI Integration Boundary
 
-Any future AI/LLM feature (auto-suggesting skill tags, generating friendlier plan copy, etc.) sits behind a narrow `AIAssistant` interface called only from the application/API layer — **never** from inside `packages/readiness-engine`. An AI service must never write directly into `practicalDepth`, `quality`, or any score field; AI-assisted suggestions populate a separate "suggested" field a human must explicitly confirm before it becomes real, scorable data. This preserves the engine's determinism guarantee regardless of what gets added later, and keeps "no AI dependency in the readiness engine" true by construction, not by discipline alone.
+Any future AI/LLM feature (auto-suggesting skill tags, generating friendlier plan copy, etc.) sits behind a narrow `AIAssistant` interface called only from the application/API layer — **never** from inside `packages/readiness-engine`. An AI service must never write directly into `practicalDepth`, `quality`, or any score field; AI-assisted suggestions populate a separate "suggested" field a human must explicitly confirm before it becomes real, scorable data. This preserves the engine's determinism guarantee regardless of what gets added later, and keeps "no AI dependency in the readiness engine" true by construction, not by discipline alone. This also covers artifact-identity resolution: `ArtifactKey` matching (§14) is deterministic, and no AI similarity/plagiarism detection sits anywhere in this boundary either (`DECISIONS.md` ADR-029).
 
 ## 7. Deployment Architecture
 
@@ -72,7 +72,7 @@ InternshipOS is recruiter-facing and portfolio-grade — the primary way anyone 
 
 ## 10. Security Boundary
 
-- **Ownership scoping:** every Evidence/ReadinessAssessment/ActionPlan/ActionItem query is scoped by the authenticated user's `studentProfileId` via one shared, tested helper — never by trusting a client-supplied ID (IDOR prevention).
+- **Ownership scoping:** every Evidence/Artifact/ArtifactKey/ReadinessAssessment/ActionPlan/ActionItem query is scoped by the authenticated user's `studentProfileId` via one shared, tested helper — never by trusting a client-supplied ID (IDOR prevention). This includes the composite `Evidence.artifactId`/`Evidence.corroboratesArtifactId` ownership check (`DECISIONS.md` ADR-022).
 - **Secrets:** `DATABASE_URL`, JWT signing secrets, and any third-party keys live in environment variables only, never committed; `.env.example` documents required keys with placeholder values.
 - **Password storage:** Argon2id hashing, never logged.
 - **Transport/session:** JWT access token (short-lived) + a DB-tracked refresh token (revocable), sent via the `Authorization` header — not cookies, which sidesteps CSRF entirely for MVP (see `API_SPEC.md` for token endpoint details).
@@ -89,7 +89,7 @@ InternshipOS is recruiter-facing and portfolio-grade — the primary way anyone 
 | Integration | API routes + real Prisma client against a test database. |
 | API | Supertest against running Express routes — auth, validation, ownership scoping, response shapes. |
 | Engine regression | Named fixture scenarios from `SCORING_MODEL.md` (the worked example, the CORE-override case) — permanent, must never silently change behavior. |
-| Database | Migration application and constraint enforcement (uniqueness, CHECK constraints). |
+| Database | Migration application and constraint enforcement (uniqueness — including `ArtifactKey`'s per-student canonical-identity constraint — and CHECK constraints). |
 | Frontend | React Testing Library on critical components (evidence form, readiness breakdown). |
 | End-to-end | Playwright, 2-3 critical-path flows only (signup to evidence to readiness to action plan to completion). |
 
@@ -107,3 +107,16 @@ Team: **ChatGPT** (product/architecture coordination, final review) · **Claude*
 - Claude and ChatGPT own and review changes to these documents. Antigravity and Codex implement against their current versions; if implementation surfaces a gap, ambiguity, or apparent error in a protected document, the correct action is to flag it back as a question or a proposed doc edit — never to silently decide and code around it.
 - Gemini may be used for independent critique or research on a proposed change to any protected document before it's finalized, as an additional check — it does not implement application code in this workflow.
 - Any change to `packages/readiness-engine` logic ships in the same PR as a corresponding update to `SCORING_MODEL.md`. Any change to the DB schema ships with a corresponding update to `DOMAIN_MODEL.md`. Any change to an API contract ships with a corresponding update to `API_SPEC.md`. Documentation drift is treated as a bug.
+
+## 14. Artifact/ArtifactKey/Versioning Consequences (MVP)
+
+Recorded following the Artifact/ArtifactKey/versioning review (`DECISIONS.md` ADR-019–030). No change to §1–13 above; this section states the architectural implications only.
+
+- **Lineage resolution happens before the engine runs.** `ArtifactKey` matching (repository/demo-URL canonicalization, or a confirmed `declaredArtifactId`) is resolved in the `evidence/` module at write time — the readiness engine never performs identity resolution itself.
+- **The engine receives normalized, lineage-resolved input.** By the time `packages/readiness-engine` runs, `Evidence` rows already carry their final `artifactId`; the engine's `Artifact`-level consolidation (`ArtifactScore = max(EvidenceScore)`) operates on already-resolved artifact groupings, not raw representations.
+- **The engine remains pure TypeScript**, unchanged from §5 — `ArtifactKey` resolution and `questionSetVersion` compatibility mapping both happen in `apps/api`, not inside `packages/readiness-engine`.
+- **Prisma stays outside the engine**, unchanged from §5 — `ArtifactKey`'s DB-level uniqueness constraint is enforced by Postgres/Prisma in the persistence layer only.
+- **Artifact identity is deterministic** — enforced by the `ArtifactKey (studentProfileId, keyType, normalizedValue)` unique constraint (§11 above), not by any similarity/plagiarism model (ADR-029).
+- **`scoringConfigVersion` and `frameworkVersion` are explicit inputs/context** to every engine invocation, alongside `evaluationDate` (§5). Neither is read from an env var or system state — both are loaded by the `readiness-engine/` persistence wrapper and passed in explicitly, consistent with §12's domain-configuration-lives-in-the-database rule.
+- **Historical assessments are immutable** (unchanged, ADR-016) — `ReadinessAssessment` now additionally snapshots `frameworkVersion` alongside `scoringConfigVersion`.
+- **Snapshot persistence is separate from current evidence mutation** — `SkillAssessmentEvidence` stores denormalized per-evidence values (score, `activityDate`, `questionSetVersion`, resolved `artifactId`) rather than depending on live FKs, so editing or deleting `Evidence`/`Artifact` rows later can never alter a historical snapshot (`DOMAIN_MODEL.md` §10, delete-behavior).
