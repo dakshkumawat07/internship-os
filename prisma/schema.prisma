@@ -1,6 +1,6 @@
 // =============================================================================
 // InternshipOS - Prisma Schema
-// Ticket: fix(db): enforce schema integrity and snapshot safety
+// Ticket: fix(db): repair migration and snapshot immutability
 // Source of truth: docs/DOMAIN_MODEL.md, docs/DECISIONS.md, docs/SCORING_MODEL.md, docs/ARCHITECTURE.md
 // =============================================================================
 
@@ -199,7 +199,7 @@ model Skill {
 
 /// Versioned, immutable scoring configuration (DOMAIN_MODEL.md section 6).
 /// Each row represents one locked version; existing rows are never overwritten.
-/// Protected by PostgreSQL BEFORE UPDATE trigger.
+/// Protected by PostgreSQL BEFORE UPDATE and BEFORE DELETE triggers.
 model ScoringConfig {
   id          String  @id @default(cuid())
   /// Canonical version string (e.g. "v1"). Unique -- version IS the identity (ADR-028).
@@ -283,13 +283,11 @@ model Artifact {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  artifactKeys             ArtifactKey[]
+  artifactKeys          ArtifactKey[]
   /// Evidence rows that represent this artifact (primary reference via composite ownership FK).
-  evidence                 Evidence[]                @relation("ArtifactEvidence")
+  evidence              Evidence[]    @relation("ArtifactEvidence")
   /// Evidence rows that corroborate this artifact (certificate/capstone link via composite ownership FK).
-  corroboratingEvidence    Evidence[]                @relation("CorroboratesArtifact")
-  /// Snapshot FK rows -- SET NULL on delete (DOMAIN_MODEL.md section 10 delete behavior).
-  skillAssessmentEvidences SkillAssessmentEvidence[]
+  corroboratingEvidence Evidence[]    @relation("CorroboratesArtifact")
 
   /// Composite ownership anchor preventing cross-student references at schema level.
   @@unique([id, studentProfileId])
@@ -339,7 +337,7 @@ model Evidence {
   title       String
   description String?
 
-  // --- Artifact linkage with composite ownership checks (BLOCKER 1 fix) ---
+  // --- Artifact linkage with composite ownership checks (BLOCKER 1 & 5 fix) ---
   /// Required for PRACTICAL evidence; optional for LEARNING.
   /// Structurally constrained to Artifact owned by the same studentProfileId.
   artifactId String?
@@ -372,12 +370,10 @@ model Evidence {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  evidenceSkills           EvidenceSkill[]
-  certificateDetail        CertificateDetail?
-  gitHubRepositoryLink     GitHubRepositoryLink?
-  hackathonDetail          HackathonDetail?
-  /// Snapshot rows -- SET NULL on delete (DOMAIN_MODEL.md section 10 delete behavior).
-  skillAssessmentEvidences SkillAssessmentEvidence[]
+  evidenceSkills       EvidenceSkill[]
+  certificateDetail    CertificateDetail?
+  gitHubRepositoryLink GitHubRepositoryLink?
+  hackathonDetail      HackathonDetail?
 
   @@index([studentProfileId])
   @@index([studentProfileId, deletedAt])
@@ -477,12 +473,12 @@ model HackathonDetail {
 // =============================================================================
 // DERIVED ASSESSMENT DOMAIN -- IMMUTABLE SNAPSHOT HIERARCHY
 // DOMAIN_MODEL.md section 7
-// Protected by PostgreSQL BEFORE UPDATE triggers (BLOCKER 5 fix)
+// Protected by PostgreSQL BEFORE UPDATE and BEFORE DELETE triggers (BLOCKER 2 & 5 fix)
 // =============================================================================
 
 /// Immutable readiness assessment snapshot for a target role at a specific evaluationDate.
 /// (DOMAIN_MODEL.md section 7 - ReadinessAssessment)
-/// Protected against UPDATE by PostgreSQL trigger trg_readiness_assessments_immutable.
+/// Protected against UPDATE and DELETE by PostgreSQL trigger trg_readiness_assessments_immutable.
 model ReadinessAssessment {
   id               String         @id @default(cuid())
   studentProfileId String
@@ -528,7 +524,7 @@ model ReadinessAssessment {
 
 /// Immutable per-skill assessment belonging to a ReadinessAssessment.
 /// (DOMAIN_MODEL.md section 7 - SkillAssessment)
-/// Protected against UPDATE by PostgreSQL trigger trg_skill_assessments_immutable.
+/// Protected against UPDATE and DELETE by PostgreSQL trigger trg_skill_assessments_immutable.
 model SkillAssessment {
   id                    String              @id @default(cuid())
   readinessAssessmentId String
@@ -562,40 +558,43 @@ model SkillAssessment {
 
 /// Immutable snapshot of evidence contributing to a SkillAssessment.
 /// (DOMAIN_MODEL.md section 7 - SkillAssessmentEvidence)
-/// Distinguishes live optional references from immutable non-nullable snapshot identifiers (BLOCKER 2 fix).
-/// Protected against UPDATE by PostgreSQL trigger trg_skill_assessment_evidence_immutable.
+/// Contains NO live FKs to mutable Evidence/Artifact (BLOCKER 3 fix: eliminates cross-student live paths).
+/// artifactIdSnapshot is nullable for artifact-less learning evidence (BLOCKER 4 fix).
+/// Protected against UPDATE and DELETE by PostgreSQL trigger trg_skill_assessment_evidence_immutable.
 model SkillAssessmentEvidence {
   id                String          @id @default(cuid())
   skillAssessmentId String
   skillAssessment   SkillAssessment @relation(fields: [skillAssessmentId], references: [id], onDelete: Restrict)
 
-  // --- Live optional FKs (SET NULL on delete -- does NOT mutate historical snapshot identifiers) ---
-  evidenceId String?
-  evidence   Evidence? @relation(fields: [evidenceId], references: [id], onDelete: SetNull)
-  artifactId String?
-  artifact   Artifact? @relation(fields: [artifactId], references: [id], onDelete: SetNull)
-
-  // --- Immutable snapshot identifiers (BLOCKER 2 fix: non-nullable, immune to live deletions) ---
+  // --- Immutable snapshot identifiers (BLOCKER 2, 3, 4 fix: no live FKs, artifactIdSnapshot nullable) ---
   evidenceIdSnapshot           String
-  artifactIdSnapshot           String
+  artifactIdSnapshot           String?
   artifactCanonicalKeySnapshot String?
 
-  // --- Denormalized snapshot values (immutable, authoritative even after live data changes) ---
-  /// Snapshot of EvidenceScore at assessment time (0-100). Enforced by CHECK constraint.
-  evidenceScore      Float
-  /// Snapshot of Evidence.activityDate used for recency calculation.
-  activityDate       DateTime
-  /// Snapshot of questionSetVersion the answers were collected under (ADR-025).
-  questionSetVersion String
-  /// Whether this evidence item was the primary practical artifact (P1).
-  isPrimaryPractical Boolean          @default(false)
-  /// Whether this evidence was categorized as practical or learning at assessment time.
+  // --- Denormalized snapshot values (immutable, fully self-contained historical evidence state) ---
+  evidenceType       EvidenceType
   evidenceCategory   EvidenceCategory
+  evidenceTitle      String
+  activityDate       DateTime
+  questionSetVersion String
+
+  /// Derived PracticalDepth at assessment time (0-100, nullable for learning evidence)
+  practicalDepth    Float?
+  /// Derived Quality at assessment time (0-100, nullable for learning evidence)
+  quality           Float?
+  /// Recency multiplier applied at assessment time (0.5-1.0)
+  recencyMultiplier Float?
+  /// EvidenceScore at assessment time (0-100). Enforced by CHECK constraint.
+  evidenceScore     Float
+
+  /// Whether this evidence item was the primary practical artifact (P1)
+  isPrimaryPractical      Boolean @default(false)
+  /// Student contribution context snapshot
+  contributionDescription String?
 
   createdAt DateTime @default(now())
 
   @@index([skillAssessmentId])
-  @@index([evidenceId])
   @@index([evidenceIdSnapshot])
   @@index([artifactIdSnapshot])
   @@map("skill_assessment_evidence")
