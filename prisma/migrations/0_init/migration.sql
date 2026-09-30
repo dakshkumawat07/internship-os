@@ -537,6 +537,16 @@ ALTER TABLE "skill_assessment_evidence" ADD CONSTRAINT "skill_assessment_evidenc
 ALTER TABLE "skill_assessment_evidence" ADD CONSTRAINT "skill_assessment_evidence_recency_range_check"
   CHECK ("recencyMultiplier" IS NULL OR ("recencyMultiplier" >= 0.5 AND "recencyMultiplier" <= 1.0));
 
+-- 5b. Practical snapshot requires non-null artifactIdSnapshot and non-empty artifactCanonicalKeySnapshot.
+ALTER TABLE "skill_assessment_evidence" ADD CONSTRAINT "skill_assessment_evidence_practical_artifact_snapshot_check"
+  CHECK (
+    "evidenceCategory" != 'PRACTICAL' OR (
+      "artifactIdSnapshot" IS NOT NULL AND
+      "artifactCanonicalKeySnapshot" IS NOT NULL AND
+      trim("artifactCanonicalKeySnapshot") <> ''
+    )
+  );
+
 -- 6. ScoringConfig recencyMultiplier range: 0.5 - 1.0.
 ALTER TABLE "scoring_configs" ADD CONSTRAINT "scoring_configs_recency_range_check"
   CHECK ("recencyMin" >= 0.5 AND "recencyMax" <= 1.0 AND "recencyMin" <= "recencyMax");

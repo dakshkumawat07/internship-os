@@ -241,7 +241,7 @@ Stores:
 
 Immutable snapshot of the relationship between an assessment and the evidence that contributed to the skill result.
 
-**Stores denormalized snapshot values** (per-evidence `EvidenceScore`, the `activityDate` used, the `questionSetVersion` the underlying answers were collected under, and the resolved `artifactId`) directly on this row, rather than depending solely on live FKs to `Evidence`/`Artifact`. This is what allows later edits to `Evidence` — or even deletion — to never rewrite or invalidate a historical snapshot.
+**Stores denormalized snapshot values** (per-evidence `EvidenceScore`, the `activityDate` used, the `questionSetVersion` the underlying answers were collected under, and plain immutable snapshot identity fields `evidenceIdSnapshot`, `artifactIdSnapshot`, `artifactCanonicalKeySnapshot`) directly on this row. Live `Evidence`/`Artifact` foreign keys were intentionally removed from `SkillAssessmentEvidence` so that historical snapshots do not depend on live `Evidence` or `Artifact` rows. This is what allows later edits to `Evidence` — or even deletion — to never rewrite, nullify, or invalidate a historical snapshot.
 
 ## 8. Action Plan Domain
 
@@ -288,7 +288,7 @@ Current scoring configuration, framework, or question-set changes must not silen
 
 **Delete behavior protecting snapshots:**
 
-Deleting an `Evidence` or `Artifact` row must never cascade-delete or null out data inside an existing `SkillAssessmentEvidence` / `SkillAssessment` / `ReadinessAssessment` snapshot, because those snapshots hold denormalized values rather than depending on the live FK remaining resolvable. Foreign keys from snapshot tables toward live `Evidence`/`Artifact` rows use `ON DELETE SET NULL` (never `CASCADE`) with the snapshot's denormalized fields remaining intact and authoritative regardless of what happens to the live FK target.
+Deleting an `Evidence` or `Artifact` row must never cascade-delete or null out data inside an existing `SkillAssessmentEvidence` / `SkillAssessment` / `ReadinessAssessment` snapshot. Snapshot identity fields (`evidenceIdSnapshot`, `artifactIdSnapshot`, `artifactCanonicalKeySnapshot`) and audit metrics are stored as plain immutable historical values; live `Evidence`/`Artifact` foreign keys were intentionally removed from `SkillAssessmentEvidence` so that historical snapshots do not depend on live `Evidence` or `Artifact` rows and remain fully authoritative regardless of changes to or deletions of live data.
 
 ## 11. Domain Invariants
 
