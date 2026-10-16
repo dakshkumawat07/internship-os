@@ -11,9 +11,16 @@
     "db:validate": "npx prisma validate",
     "db:generate": "npx prisma generate",
     "db:migrate:dev": "npx prisma migrate dev",
-    "db:migrate:deploy": "npx prisma migrate deploy"
+    "db:migrate:deploy": "npx prisma migrate deploy",
+    "build:engine": "npm --workspace=@internship-os/readiness-engine run build",
+    "test:engine": "npm --workspace=@internship-os/readiness-engine run test",
+    "test": "npm run test:engine"
   },
+  "workspaces": [
+    "packages/*"
+  ],
   "devDependencies": {
+    "@types/node": "^26.6.3",
     "prisma": "^5.22.0",
     "typescript": "^5.5.4"
   },

@@ -1,0 +1,16 @@
+{
+  "name": "@internship-os/readiness-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pure deterministic readiness engine for InternshipOS",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test dist/tests/regression-suite.test.js dist/tests/evidence-scorer.test.js dist/tests/recency.test.js dist/tests/role-readiness.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
